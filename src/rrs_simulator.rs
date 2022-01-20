@@ -6,15 +6,19 @@ use crate::{
     message::{Message, MessageStatus, NodeId},
     message_queue::MessageQueue,
     node_status::{NodeStatus, UpdateBloomFilter},
-    performance_result::summarize_data,
+    performance_result::{summarize_data, ResultPack},
 };
 
 const MAX_HOP_NUM: u32 = 10;
 const EACH_HANDLE_COUNT: u32 = 3;
-const SEND_MESSAGE_DELAY_RANGE: (u32, u32) = (1, 5);
-const SEND_HASH_DELAY_RANGE: (u32, u32) = (1, 5);
+// delay:
+const SEND_MESSAGE_DELAY_RANGE: (u32, u32) = (100, 120);
+const SEND_HASH_DELAY_RANGE: (u32, u32) = (100, 140);
+const SEND_ASK_FOR_DELAY_RANGE: (u32, u32) = (100, 130);
+const SEND_REPLY_ASK_DELAY_RANGE: (u32, u32) = (100, 130);
+const SEND_ASK_INTERVAL: u32 = 50;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParamsPacket {
     /// network node scale
     node_size: u32,
@@ -22,11 +26,26 @@ pub struct ParamsPacket {
     t: u32,
     /// after message has been passed by `k` round, it will be transform into msg_hash header message and goes on.
     k: u32,
+    /// simulate message count
+    n: u32,
 }
 
 impl ParamsPacket {
-    pub fn new(node_size: u32, t: u32, k: u32) -> Self {
-        ParamsPacket { node_size, t, k }
+    pub fn new(node_size: u32, t: u32, k: u32, n: u32) -> Self {
+        ParamsPacket { node_size, t, k, n }
+    }
+
+    pub fn node_size(&self) -> u32 {
+        self.node_size
+    }
+    pub fn t(&self) -> u32 {
+        self.t
+    }
+    pub fn k(&self) -> u32 {
+        self.k
+    }
+    pub fn n(&self) -> u32 {
+        self.n
     }
 }
 
@@ -55,36 +74,49 @@ impl RRSSimulator {
     }
 
     pub fn do_test(&mut self) {
-        self.message_queue.reset_message_queue();
-        self.node_status.iter_mut().for_each(|ns| ns.reset_status());
+        let mut r = ResultPack::new(&self.params);
 
-        // todo create a src broadcast message.
-        let message = Message::build_send_full_message(0, 0, 0);
-        self.message_queue.push(message, 0);
+        for _ in 0..self.params.n {
+            self.message_queue.reset_message_queue();
+            self.node_status.iter_mut().for_each(|ns| ns.reset_status());
 
-        self.start_one_test();
+            // create a src broadcast message.
+            let message = Message::build_send_full_message(0, 0, 0);
+            self.message_queue.push(message, 0);
 
-        // self.node_status.iter().for_each(|f| {
-        //     println!("{:?}", f);
-        // });
+            self.start_one_test();
 
-        summarize_data(&self.node_status, &self.message_queue);
+            self.node_status.iter().for_each(|f| {
+                log::debug!(
+                    "recv_hash_count: {:?} recv_message_count:{:?} ",
+                    f.recv_hash_count(),
+                    f.recv_message_count(),
+                );
+            });
+
+            summarize_data(&mut r, &self.node_status, &self.message_queue);
+        }
+        r.show();
     }
 
     fn start_one_test(&mut self) {
         while let Some((message, ts)) = self.message_queue.pop_front() {
-            let recv_node_id: NodeId = message.to;
-            let mut node_status = self.node_status.get_mut(recv_node_id).unwrap();
-            // println!("{} handle message {:?}", recv_node_id, message);
+            let send_node_id = message.to;
+            let mut send_node_status = self.node_status.get_mut(send_node_id).unwrap();
+            log::debug!("{} handle message {:?} at ts {}", send_node_id, message, ts);
             let next_hop_num = message.hop_num + 1;
             if next_hop_num > MAX_HOP_NUM {
                 continue;
             }
             match message.status {
                 MessageStatus::FullMessage => {
-                    let send_node_id = recv_node_id;
-                    node_status.record_recv_message();
-                    if next_hop_num < self.params.k {
+                    send_node_status.record_recv_message();
+
+                    if send_node_status.stop_handle_message(EACH_HANDLE_COUNT) {
+                        continue;
+                    }
+
+                    if next_hop_num <= self.params.k {
                         let mut send_message = Message::build_send_full_message(
                             send_node_id,
                             send_node_id,
@@ -92,8 +124,8 @@ impl RRSSimulator {
                         ); // set `to` later when push it in message queue
 
                         // update send nodes' bloom status
-                        self.node_status[send_node_id].update_bloom_filter(&message.from);
-                        self.node_status[send_node_id].update_bloom_filter(&message.bloomstatus);
+                        send_node_status.update_bloom_filter(&message.from);
+                        send_node_status.update_bloom_filter(&message.bloomstatus);
 
                         // get dst list
                         let dst_list = self.get_send_dst_list(
@@ -101,8 +133,9 @@ impl RRSSimulator {
                             &self.node_status[send_node_id].get_already_recvd_nodes(),
                         );
 
+                        let mut send_node_status = self.node_status.get_mut(send_node_id).unwrap();
                         // update send nodes' bloom status of ready to send nodes.
-                        self.node_status[send_node_id].update_bloom_filter(&dst_list);
+                        send_node_status.update_bloom_filter(&dst_list);
                         if dst_list.is_empty() {
                             continue;
                         }
@@ -121,14 +154,14 @@ impl RRSSimulator {
                             let next_ts = random_delay(ts, SEND_MESSAGE_DELAY_RANGE);
                             let res = self.message_queue.push(send_message.clone(), next_ts);
 
-                            // println!(
-                            //     "  -> send msg {:?} to {} ts: {}  res:{} queue_len:{}",
-                            //     send_message,
-                            //     *dst,
-                            //     next_ts,
-                            //     res,
-                            //     self.message_queue.len()
-                            // );
+                            log::debug!(
+                                "  -> send msg {:?} to {} ts: {}  res:{} queue_len:{}",
+                                send_message,
+                                *dst,
+                                next_ts,
+                                res,
+                                self.message_queue.len()
+                            );
                         })
                     } else if next_hop_num < MAX_HOP_NUM {
                         // after k round, send msg hash
@@ -146,7 +179,7 @@ impl RRSSimulator {
                             send_message.to = *dst;
                             let next_ts = random_delay(ts, SEND_HASH_DELAY_RANGE);
                             let res = self.message_queue.push(send_message.clone(), next_ts);
-                            println!(
+                            log::debug!(
                                 "  -> send hash {:?} to {} ts: {}  res:{} queue_len:{}",
                                 send_message,
                                 *dst,
@@ -158,10 +191,9 @@ impl RRSSimulator {
                     }
                 }
                 MessageStatus::OnlyHash => {
-                    let send_node_id = recv_node_id;
-                    node_status.record_recv_hash();
+                    send_node_status.record_recv_hash();
 
-                    if node_status.stop_handle_message(EACH_HANDLE_COUNT) {
+                    if send_node_status.stop_handle_message(EACH_HANDLE_COUNT) {
                         continue;
                     }
 
@@ -176,7 +208,7 @@ impl RRSSimulator {
                         send_message.to = *dst;
                         let next_ts = random_delay(ts, SEND_HASH_DELAY_RANGE);
                         let res = self.message_queue.push(send_message.clone(), next_ts);
-                        println!(
+                        log::debug!(
                             "  -> send hash {:?} to {} ts: {}  res:{} queue_len:{}",
                             send_message,
                             *dst,
@@ -184,10 +216,54 @@ impl RRSSimulator {
                             res,
                             self.message_queue.len()
                         );
-                    })
+                    });
+
+                    // ask for if not recvd
+                    if !self.node_status[send_node_id].has_recv_full_message() {
+                        if (self.node_status[send_node_id].send_ask_for_ts() == 0
+                            || ((self.node_status[send_node_id].send_ask_for_ts()
+                                + SEND_ASK_INTERVAL)
+                                < ts))
+                        {
+                            let send_ask_message = Message::build_send_query_message(
+                                send_node_id,
+                                get_random_neighbour(
+                                    send_node_id,
+                                    self.params.node_size as usize,
+                                    1,
+                                )[0],
+                            );
+                            let mut send_node_status =
+                                self.node_status.get_mut(send_node_id).unwrap();
+                            send_node_status.record_send_ask_for(ts);
+                            let next_ts = random_delay(ts, SEND_ASK_FOR_DELAY_RANGE);
+                            let res = self.message_queue.push(send_ask_message.clone(), next_ts);
+                            log::debug!(
+                                "  -> send ask for {:?} to {} ts: {}  res:{} queue_len:{}",
+                                send_ask_message,
+                                message.from,
+                                next_ts,
+                                res,
+                                self.message_queue.len()
+                            );
+                        }
+                    }
                 }
                 MessageStatus::AskForMessage => {
-                    todo!()
+                    if self.node_status[send_node_id].has_recv_full_message() {
+                        let send_message =
+                            Message::build_send_full_message(send_node_id, message.from, 0);
+                        let next_ts = random_delay(ts, SEND_REPLY_ASK_DELAY_RANGE);
+                        let res = self.message_queue.push(send_message.clone(), next_ts);
+                        log::debug!(
+                            "  -> send reply ask {:?} to {} ts: {}  res:{} queue_len:{}",
+                            send_message,
+                            message.from,
+                            next_ts,
+                            res,
+                            self.message_queue.len()
+                        );
+                    }
                 }
             }
         }
@@ -206,7 +282,7 @@ impl RRSSimulator {
                 if !bloomstatus.contains(&d) {
                     true
                 } else {
-                    // println!("  filtered, wont send {}", d);
+                    log::debug!("  filtered, wont send {}", d);
                     false
                 }
             })

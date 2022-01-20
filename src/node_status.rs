@@ -8,9 +8,9 @@ pub struct NodeStatus {
     has_recv_full_message: bool,
     recv_hash_count: u32,
     recv_message_count: u32,
-    handle_message_count: u32,
     handle_hash_count: u32,
     bloom_filter_info: Vec<bool>, // from each nodes aspect, if other nodes has recvd message
+    send_ask_for_ts: u32,
 }
 
 // getter
@@ -23,9 +23,6 @@ impl NodeStatus {
     }
     pub fn recv_message_count(&self) -> u32 {
         self.recv_message_count
-    }
-    pub fn handle_message_count(&self) -> u32 {
-        self.handle_message_count
     }
     pub fn handle_hash_count(&self) -> u32 {
         self.handle_hash_count
@@ -40,6 +37,9 @@ impl NodeStatus {
                 set.insert(index);
             });
         set
+    }
+    pub fn send_ask_for_ts(&self) -> u32 {
+        self.send_ask_for_ts
     }
 }
 
@@ -75,9 +75,9 @@ impl NodeStatus {
             has_recv_full_message: false,
             recv_hash_count: 0,
             recv_message_count: 0,
-            handle_message_count: 0,
             handle_hash_count: 0,
             bloom_filter_info: vec![false; node_size],
+            send_ask_for_ts: 0,
         }
     }
 
@@ -95,14 +95,18 @@ impl NodeStatus {
         self.recv_hash_count += 1;
     }
 
+    pub fn record_send_ask_for(&mut self, ts: u32) {
+        self.send_ask_for_ts = ts;
+    }
+
     pub fn reset_status(&mut self) {
         self.has_recv_full_message = false;
         self.recv_hash_count = 0;
         self.recv_message_count = 0;
-        self.handle_message_count = 0;
         self.handle_hash_count = 0;
         for _recvd in &mut self.bloom_filter_info {
             *_recvd = false;
         }
+        self.send_ask_for_ts = 0;
     }
 }
